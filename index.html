@@ -1,0 +1,504 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>MMORPG Client</title>
+    <link rel="preload" as="image" href="./world.jpg">
+    <link rel="stylesheet" href="./styles.css">
+  </head>
+  <body>
+    <canvas id="world"></canvas>
+    <script>
+      (function () {
+        const canvas = document.getElementById('world');
+        const context = canvas.getContext('2d');
+
+        const worldImage = new Image();
+        worldImage.src = './world.jpg';
+        let isImageLoaded = false;
+
+        // --- Networking state ---
+        const SERVER_URL = 'wss://codepath-mmorg.onrender.com';
+        let socket = null;
+
+        // --- Game state ---
+        const world = { width: 0, height: 0 };
+        const camera = { x: 0, y: 0, vw: 0, vh: 0 };
+        let myPlayerId = null;
+        let myPlayer = null; // reference to entry in playersById
+        const playersById = new Map(); // id -> { id, x, y, facing, isMoving, username, animationFrame, avatar }
+        const avatarsByName = new Map(); // name -> { frames: { north: Image[], south: Image[], east: Image[] } }
+        let isReadyToRender = false;
+        // --- NPC state ---
+        const npcs = []; // { id, x, y, facing, isMoving, username, animationFrame, avatarName, vx, vy, changeAtMs }
+        let lastFrameTimeMs = 0;
+
+        function resizeCanvasToDisplaySize() {
+          const devicePixelRatio = window.devicePixelRatio || 1;
+
+          // Use the laid-out CSS size of the canvas
+          const cssWidth = canvas.clientWidth;
+          const cssHeight = canvas.clientHeight;
+
+          // Match the backing store size to the CSS size, multiplied by DPR for crisp rendering
+          const displayWidth = Math.max(1, Math.floor(cssWidth * devicePixelRatio));
+          const displayHeight = Math.max(1, Math.floor(cssHeight * devicePixelRatio));
+
+          if (canvas.width !== displayWidth || canvas.height !== displayHeight) {
+            canvas.width = displayWidth;
+            canvas.height = displayHeight;
+          }
+
+          // Reset any existing transforms, then scale so 1 canvas unit == 1 CSS pixel
+          context.setTransform(1, 0, 0, 1, 0, 0);
+          context.scale(devicePixelRatio, devicePixelRatio);
+
+          camera.vw = cssWidth;
+          camera.vh = cssHeight;
+          updateCamera();
+        }
+
+        function clamp(value, min, max) {
+          return Math.max(min, Math.min(max, value));
+        }
+
+        function updateCamera() {
+          if (!isImageLoaded) return;
+          world.width = worldImage.naturalWidth;
+          world.height = worldImage.naturalHeight;
+
+          if (myPlayer) {
+            const desiredX = Math.floor(myPlayer.x - camera.vw / 2);
+            const desiredY = Math.floor(myPlayer.y - camera.vh / 2);
+            const maxX = Math.max(0, world.width - camera.vw);
+            const maxY = Math.max(0, world.height - camera.vh);
+            camera.x = clamp(desiredX, 0, maxX);
+            camera.y = clamp(desiredY, 0, maxY);
+          } else {
+            camera.x = 0;
+            camera.y = 0;
+          }
+        }
+
+        function drawFrame() {
+          const viewportWidth = camera.vw;
+          const viewportHeight = camera.vh;
+          // Clear in CSS pixel space
+          context.clearRect(0, 0, viewportWidth, viewportHeight);
+
+          if (!isImageLoaded) return;
+
+          // Draw the world slice at native resolution (no scaling)
+          const sWidth = Math.min(viewportWidth, worldImage.naturalWidth - camera.x);
+          const sHeight = Math.min(viewportHeight, worldImage.naturalHeight - camera.y);
+          if (sWidth > 0 && sHeight > 0) {
+            context.drawImage(
+              worldImage,
+              camera.x,
+              camera.y,
+              sWidth,
+              sHeight,
+              0,
+              0,
+              sWidth,
+              sHeight
+            );
+          }
+
+          // Draw all players (including me)
+          if (isReadyToRender && playersById.size > 0) {
+            context.imageSmoothingEnabled = false;
+            playersById.forEach(function (player) {
+              const avatar = player.avatarName ? avatarsByName.get(player.avatarName) : null;
+              if (!avatar) return;
+
+              // Choose frame
+              const facing = player.facing || 'south';
+              const framesForFacing = avatar.frames[facing] || avatar.frames['south'] || [];
+              let img = framesForFacing[Math.max(0, Math.min(framesForFacing.length - 1, player.animationFrame || 0))];
+              const isWest = facing === 'west' && avatar.frames['east'] && (!avatar.frames['west'] || avatar.frames['west'].length === 0);
+              if (isWest) {
+                // Use east frame for west and flip
+                const eastFrames = avatar.frames['east'] || [];
+                img = eastFrames[Math.max(0, Math.min(eastFrames.length - 1, player.animationFrame || 0))];
+              }
+              if (!img || !img.complete) return;
+
+              const imgW = img.naturalWidth;
+              const imgH = img.naturalHeight;
+              const screenXCenter = player.x - camera.x;
+              const screenYCenter = player.y - camera.y;
+              const dx = Math.round(screenXCenter - imgW / 2);
+              const dy = Math.round(screenYCenter - imgH / 2);
+
+              if (dx + imgW < 0 || dy + imgH < 0 || dx > viewportWidth || dy > viewportHeight) return;
+
+              if (isWest) {
+                context.save();
+                context.translate(dx + imgW, dy);
+                context.scale(-1, 1);
+                context.drawImage(img, 0, 0);
+                context.restore();
+              } else {
+                context.drawImage(img, dx, dy);
+              }
+
+              drawUsernameLabel(player.username || '', dx + imgW / 2, dy - 6);
+            });
+          }
+
+          // Draw NPCs
+          if (isReadyToRender && npcs.length > 0) {
+            context.imageSmoothingEnabled = false;
+            npcs.forEach(function (npc) {
+              const avatar = npc.avatarName ? avatarsByName.get(npc.avatarName) : null;
+              if (!avatar) return;
+              const facing = npc.facing || 'south';
+              const framesForFacing = avatar.frames[facing] || avatar.frames['south'] || [];
+              let img = framesForFacing[Math.max(0, Math.min(framesForFacing.length - 1, npc.animationFrame || 0))];
+              const isWest = facing === 'west' && avatar.frames['east'] && (!avatar.frames['west'] || avatar.frames['west'].length === 0);
+              if (isWest) {
+                const eastFrames = avatar.frames['east'] || [];
+                img = eastFrames[Math.max(0, Math.min(eastFrames.length - 1, npc.animationFrame || 0))];
+              }
+              if (!img || !img.complete) return;
+
+              const imgW = img.naturalWidth;
+              const imgH = img.naturalHeight;
+              const screenXCenter = npc.x - camera.x;
+              const screenYCenter = npc.y - camera.y;
+              const dx = Math.round(screenXCenter - imgW / 2);
+              const dy = Math.round(screenYCenter - imgH / 2);
+              if (dx + imgW < 0 || dy + imgH < 0 || dx > viewportWidth || dy > viewportHeight) return;
+              if (isWest) {
+                context.save();
+                context.translate(dx + imgW, dy);
+                context.scale(-1, 1);
+                context.drawImage(img, 0, 0);
+                context.restore();
+              } else {
+                context.drawImage(img, dx, dy);
+              }
+              drawUsernameLabel(npc.username || 'NPC', dx + imgW / 2, dy - 6);
+            });
+          }
+        }
+
+        function drawUsernameLabel(text, centerX, baselineY) {
+          const paddingX = 6;
+          const paddingY = 2;
+          context.font = '12px system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif';
+          context.textBaseline = 'alphabetic';
+          const metrics = context.measureText(text);
+          const textWidth = Math.ceil(metrics.width);
+          const boxWidth = textWidth + paddingX * 2;
+          const boxHeight = 14 + paddingY * 2; // approx text height
+          const x = Math.round(centerX - boxWidth / 2);
+          const y = Math.round(baselineY - boxHeight + paddingY);
+
+          context.fillStyle = 'rgba(0,0,0,0.6)';
+          context.fillRect(x, y, boxWidth, boxHeight);
+
+          context.fillStyle = '#fff';
+          context.fillText(text, x + paddingX, y + boxHeight - paddingY - 2);
+        }
+
+        function animationLoop(nowMs) {
+          if (!lastFrameTimeMs) lastFrameTimeMs = nowMs;
+          const dtMs = nowMs - lastFrameTimeMs;
+          lastFrameTimeMs = nowMs;
+          updateNPCs(dtMs);
+          updateCamera();
+          drawFrame();
+          requestAnimationFrame(animationLoop);
+        }
+
+        function connect() {
+          try {
+            socket = new WebSocket(SERVER_URL);
+          } catch (err) {
+            console.error('WebSocket creation failed:', err);
+            return;
+          }
+
+          socket.addEventListener('open', function () {
+            const joinMsg = { action: 'join_game', username: 'V' };
+            socket.send(JSON.stringify(joinMsg));
+          });
+
+          socket.addEventListener('message', function (event) {
+            let msg;
+            try {
+              msg = JSON.parse(event.data);
+            } catch (e) {
+              console.warn('Invalid message JSON:', event.data);
+              return;
+            }
+
+            if (msg && msg.action === 'join_game' && msg.success) {
+              handleJoinGame(msg);
+            } else if (msg && msg.action === 'players_moved' && msg.players) {
+              handlePlayersMoved(msg.players);
+            } else if (msg && msg.action === 'player_joined' && msg.player) {
+              handlePlayerJoined(msg.player, msg.avatar);
+            } else if (msg && msg.action === 'player_left' && msg.playerId) {
+              handlePlayerLeft(msg.playerId);
+            }
+          });
+
+          socket.addEventListener('error', function (e) {
+            console.error('WebSocket error', e);
+          });
+
+          socket.addEventListener('close', function () {
+            // No auto-reconnect for now
+          });
+        }
+
+        function sendMove(direction) {
+          if (!socket || socket.readyState !== 1) return;
+          socket.send(JSON.stringify({ action: 'move', direction: direction }));
+          if (myPlayer) {
+            myPlayer.isMoving = true;
+            // Map server facings to our directions naming
+            if (direction === 'up') myPlayer.facing = 'north';
+            else if (direction === 'down') myPlayer.facing = 'south';
+            else if (direction === 'left') myPlayer.facing = 'west';
+            else if (direction === 'right') myPlayer.facing = 'east';
+          }
+        }
+
+        function sendStop() {
+          if (!socket || socket.readyState !== 1) return;
+          socket.send(JSON.stringify({ action: 'stop' }));
+          if (myPlayer) {
+            myPlayer.isMoving = false;
+          }
+        }
+
+        function handleKeyDown(e) {
+          const key = e.key;
+          if (key === 'ArrowUp' || key === 'ArrowDown' || key === 'ArrowLeft' || key === 'ArrowRight') {
+            e.preventDefault();
+            const direction = key === 'ArrowUp' ? 'up' : key === 'ArrowDown' ? 'down' : key === 'ArrowLeft' ? 'left' : 'right';
+            // Send on every keydown event, including repeats
+            sendMove(direction);
+          }
+        }
+
+        function handleKeyUp(e) {
+          const key = e.key;
+          if (key === 'ArrowUp' || key === 'ArrowDown' || key === 'ArrowLeft' || key === 'ArrowRight') {
+            e.preventDefault();
+            sendStop();
+          }
+        }
+
+        function handleJoinGame(payload) {
+          myPlayerId = payload.playerId;
+          const players = payload.players || {};
+          // Populate players map
+          Object.keys(players).forEach(function (id) {
+            const p = players[id];
+            playersById.set(id, {
+              id: p.id,
+              x: p.x,
+              y: p.y,
+              facing: p.facing || 'south',
+              isMoving: !!p.isMoving,
+              username: p.username || '',
+              animationFrame: p.animationFrame || 0,
+              avatarName: p.avatar
+            });
+          });
+
+          myPlayer = playersById.get(myPlayerId) || null;
+
+          // Preload avatars provided
+          const avatars = payload.avatars || {};
+          loadAllAvatars(avatars).then(function () {
+            isReadyToRender = true;
+            updateCamera();
+            spawnNPCsIfNeeded();
+          });
+        }
+
+        function handlePlayersMoved(playersObj) {
+          if (!playersObj) return;
+          Object.keys(playersObj).forEach(function (id) {
+            const update = playersObj[id];
+            const player = playersById.get(id);
+            if (!player) return;
+            if (typeof update.x === 'number') player.x = update.x;
+            if (typeof update.y === 'number') player.y = update.y;
+            if (typeof update.animationFrame === 'number') player.animationFrame = update.animationFrame;
+            if (typeof update.isMoving === 'boolean') player.isMoving = update.isMoving;
+            if (typeof update.facing === 'string') player.facing = update.facing;
+          });
+        }
+
+        function handlePlayerJoined(player, avatarDef) {
+          // Cache avatar frames if provided
+          if (avatarDef && avatarDef.name && !avatarsByName.has(avatarDef.name)) {
+            loadAvatarFrames(avatarDef).then(function (loaded) {
+              avatarsByName.set(loaded.name, loaded);
+            });
+          }
+          playersById.set(player.id, {
+            id: player.id,
+            x: player.x,
+            y: player.y,
+            facing: player.facing || 'south',
+            isMoving: !!player.isMoving,
+            username: player.username || '',
+            animationFrame: player.animationFrame || 0,
+            avatarName: player.avatar
+          });
+        }
+
+        function handlePlayerLeft(playerId) {
+          playersById.delete(playerId);
+          if (playerId === myPlayerId) {
+            myPlayer = null;
+          }
+        }
+
+        function loadAvatarFrames(avatarDef) {
+          const directions = ['north', 'south', 'east'];
+          const framesObj = { north: [], south: [], east: [] };
+          const loadPromises = [];
+
+          directions.forEach(function (dir) {
+            const frames = (avatarDef.frames && avatarDef.frames[dir]) || [];
+            frames.forEach(function (src, idx) {
+              const img = new Image();
+              img.decoding = 'async';
+              img.src = src;
+              framesObj[dir][idx] = img;
+              loadPromises.push(new Promise(function (resolve) {
+                if (img.complete) return resolve();
+                img.onload = function () { resolve(); };
+                img.onerror = function () { resolve(); };
+              }));
+            });
+          });
+
+          return Promise.all(loadPromises).then(function () {
+            return { name: avatarDef.name, frames: framesObj };
+          });
+        }
+
+        function loadAllAvatars(avatarsObj) {
+          const names = Object.keys(avatarsObj || {});
+          const promises = [];
+          names.forEach(function (name) {
+            if (avatarsByName.has(name)) return;
+            const def = avatarsObj[name];
+            promises.push(loadAvatarFrames(def).then(function (loaded) {
+              avatarsByName.set(loaded.name, loaded);
+            }));
+          });
+          return Promise.all(promises);
+        }
+
+        function randomInt(min, max) {
+          return Math.floor(Math.random() * (max - min + 1)) + min;
+        }
+
+        function pickFacingFromVelocity(vx, vy) {
+          if (Math.abs(vx) > Math.abs(vy)) {
+            return vx < 0 ? 'west' : 'east';
+          }
+          return vy < 0 ? 'north' : 'south';
+        }
+
+        function spawnNPCsIfNeeded() {
+          if (!isReadyToRender) return;
+          if (npcs.length > 0) return;
+          const avatarNames = Array.from(avatarsByName.keys());
+          if (avatarNames.length === 0) return;
+          const count = 6;
+          for (let i = 0; i < count; i++) {
+            const avatarName = avatarNames[i % avatarNames.length];
+            const x = randomInt(64, Math.max(64, worldImage.naturalWidth - 64));
+            const y = randomInt(64, Math.max(64, worldImage.naturalHeight - 64));
+            const speed = 60; // pixels/sec
+            const angle = Math.random() * Math.PI * 2;
+            const vx = Math.cos(angle) * speed;
+            const vy = Math.sin(angle) * speed;
+            npcs.push({
+              id: 'npc_' + i,
+              x: x,
+              y: y,
+              facing: pickFacingFromVelocity(vx, vy),
+              isMoving: true,
+              username: 'NPC ' + (i + 1),
+              animationFrame: 0,
+              avatarName: avatarName,
+              vx: vx,
+              vy: vy,
+              changeAtMs: performance.now() + randomInt(1500, 4000)
+            });
+          }
+        }
+
+        function updateNPCs(dtMs) {
+          if (!isReadyToRender || npcs.length === 0) return;
+          const dt = dtMs / 1000;
+          const now = performance.now();
+          npcs.forEach(function (npc) {
+            // Change direction occasionally
+            if (now >= npc.changeAtMs) {
+              const speed = Math.hypot(npc.vx, npc.vy) || 60;
+              const angle = Math.random() * Math.PI * 2;
+              npc.vx = Math.cos(angle) * speed;
+              npc.vy = Math.sin(angle) * speed;
+              npc.changeAtMs = now + randomInt(1500, 4000);
+            }
+
+            // Integrate position
+            npc.x += npc.vx * dt;
+            npc.y += npc.vy * dt;
+
+            // Clamp to world and bounce
+            if (npc.x < 16) { npc.x = 16; npc.vx = Math.abs(npc.vx); }
+            if (npc.y < 16) { npc.y = 16; npc.vy = Math.abs(npc.vy); }
+            if (npc.x > worldImage.naturalWidth - 16) { npc.x = worldImage.naturalWidth - 16; npc.vx = -Math.abs(npc.vx); }
+            if (npc.y > worldImage.naturalHeight - 16) { npc.y = worldImage.naturalHeight - 16; npc.vy = -Math.abs(npc.vy); }
+
+            // Facing and animation frame
+            npc.facing = pickFacingFromVelocity(npc.vx, npc.vy);
+            npc.isMoving = (Math.abs(npc.vx) + Math.abs(npc.vy)) > 1;
+            if (npc.isMoving) {
+              // Cycle 0-2 roughly every 180ms
+              const cycle = Math.floor((now / 180) % 3);
+              npc.animationFrame = cycle;
+            } else {
+              npc.animationFrame = 0;
+            }
+          });
+        }
+
+        worldImage.addEventListener('load', function () {
+          isImageLoaded = true;
+          resizeCanvasToDisplaySize();
+        });
+
+        window.addEventListener('resize', function () {
+          resizeCanvasToDisplaySize();
+        }, { passive: true });
+
+        window.addEventListener('keydown', handleKeyDown, { passive: false });
+        window.addEventListener('keyup', handleKeyUp, { passive: false });
+
+        // Initial sizing
+        resizeCanvasToDisplaySize();
+        connect();
+        requestAnimationFrame(animationLoop);
+      })();
+    </script>
+  </body>
+  </html>
+
+
